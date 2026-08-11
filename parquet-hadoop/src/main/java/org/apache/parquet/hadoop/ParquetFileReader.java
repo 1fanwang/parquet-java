@@ -65,6 +65,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.parquet.HadoopReadOptions;
 import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.Preconditions;
+import org.apache.parquet.bytes.ByteBufferAllocator;
 import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.bytes.ByteBufferReleaser;
 import org.apache.parquet.bytes.BytesInput;
@@ -1378,7 +1379,7 @@ public class ParquetFileReader implements Closeable {
     }
     LOG.debug("Reading {} bytes of data with vectored IO in {} ranges", totalSize, ranges.size());
     // Request a vectored read;
-    f.readVectored(ranges, options.getAllocator());
+    f.readVectored(ranges, new VectoredReadAllocator(options.getAllocator(), builder));
     int k = 0;
     for (ConsecutivePartList consecutivePart : allParts) {
       ParquetFileRange currRange = ranges.get(k++);
@@ -1895,6 +1896,10 @@ public class ParquetFileReader implements Closeable {
       toRelease.forEach(releaser::releaseLater);
     }
 
+    void addBufferToRelease(ByteBuffer toRelease) {
+      releaser.releaseLater(toRelease);
+    }
+
     void setOffsetIndex(ChunkDescriptor descriptor, OffsetIndex offsetIndex) {
       map.computeIfAbsent(descriptor, d -> new ChunkData()).offsetIndex = offsetIndex;
     }
@@ -1913,6 +1918,45 @@ public class ParquetFileReader implements Closeable {
         }
       }
       return chunks;
+    }
+  }
+
+  /**
+   * Allocator that registers every buffer it hands out with a {@link ChunkListBuilder}, so the
+   * buffers a vectored read allocates are returned to the underlying allocator when the row group
+   * is released.
+   * <p>
+   * Filesystems allocate through the function supplied to
+   * {@link SeekableInputStream#readVectored(List, ByteBufferAllocator)} but are free to merge
+   * ranges and complete the futures with slices of a single allocation. Recording the allocations
+   * therefore releases exactly what was allocated, which the buffers reaching the futures do not
+   * always identify.
+   */
+  private static final class VectoredReadAllocator implements ByteBufferAllocator {
+
+    private final ByteBufferAllocator delegate;
+    private final ChunkListBuilder builder;
+
+    VectoredReadAllocator(ByteBufferAllocator delegate, ChunkListBuilder builder) {
+      this.delegate = delegate;
+      this.builder = builder;
+    }
+
+    @Override
+    public ByteBuffer allocate(int size) {
+      ByteBuffer buffer = delegate.allocate(size);
+      builder.addBufferToRelease(buffer);
+      return buffer;
+    }
+
+    @Override
+    public void release(ByteBuffer b) {
+      delegate.release(b);
+    }
+
+    @Override
+    public boolean isDirect() {
+      return delegate.isDirect();
     }
   }
 
